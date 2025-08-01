@@ -8,8 +8,8 @@
 
 // --- Configuration ---
 // Path to the SQLite database file.
-// This path now points to the database file in the Python collector directory.
-$databaseFile = '/var/www/openwrt_collector/openwrt_traffic.db';
+// IMPORTANT: This path must match the location where the Python script stores the DB.
+$databaseFile = '/home/openwrt/logger/openwrt_traffic.db';
 
 // Set the Content-Type header to application/json
 header('Content-Type: application/json');
@@ -23,21 +23,19 @@ try {
     $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
     // Determine which data type to fetch based on 'type' URL parameter
-    $dataType = $_GET['type'] ?? 'traffic'; // Default to 'traffic'
+    $dataType = $_GET['type'] ?? 'dashboard'; // Default to 'dashboard'
 
-    $tableName = '';
-    $columns = '';
-    $orderBy = '';
-    $lastUpdated = null; // Initialize last updated timestamp
     $processedResults = []; // Initialize processed results array
+    $lastUpdated = null; // Initialize last updated timestamp
+
+    // Fetch the last update timestamp from the traffic_data table, which is still a good indicator
+    $stmtLastUpdate = $conn->prepare("SELECT MAX(timestamp) FROM traffic_data");
+    $stmtLastUpdate->execute();
+    $lastUpdated = $stmtLastUpdate->fetchColumn();
 
     if ($dataType === 'leases') {
-        $tableName = 'dhcp_leases';
-        $columns = 'mac_address, ip_address, hostname';
-        $orderBy = 'mac_address ASC';
-
-        // Fetch all results as an associative array
-        $stmt = $conn->prepare("SELECT " . $columns . " FROM " . $tableName . " ORDER BY " . $orderBy);
+        // Fetch all DHCP lease data
+        $stmt = $conn->prepare("SELECT mac_address, ip_address, hostname FROM dhcp_leases ORDER BY mac_address ASC");
         $stmt->execute();
         $rawResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -60,85 +58,44 @@ try {
                 ];
             }
         }
-    } elseif ($dataType === 'final') {
-        // Fetch aggregated traffic data (sum over the entire period)
-        // This query sums RX/TX bytes per device_mac across all stored timestamps
-        $stmtTraffic = $conn->prepare("SELECT device_mac, SUM(rx_bytes) as total_rx_bytes, SUM(tx_bytes) as total_tx_bytes FROM traffic_data GROUP BY device_mac ORDER BY device_mac ASC");
-        $stmtTraffic->execute();
-        $trafficData = $stmtTraffic->fetchAll(PDO::FETCH_ASSOC);
-
-        // Fetch all DHCP lease data to map MAC to hostname/IP
-        $stmtLeases = $conn->prepare("SELECT mac_address, ip_address, hostname FROM dhcp_leases");
-        $stmtLeases->execute();
-        $leasesData = $stmtLeases->fetchAll(PDO::FETCH_ASSOC);
-
-        $macToHostnameMap = [];
-        foreach ($leasesData as $leaseRow) {
-            $mac = $leaseRow['mac_address'];
-            $ip = $leaseRow['ip_address'];
-            $hostname = $leaseRow['hostname'];
-
-            $resolvedHostname = null;
-            if (!empty($hostname)) {
-                $resolvedHostname = $hostname;
-            } elseif (!empty($ip)) {
-                $resolvedHostname = $ip;
-            } else {
-                $resolvedHostname = $mac; // Fallback to MAC if no hostname or IP
-            }
-            $macToHostnameMap[$mac] = $resolvedHostname;
-        }
-
-        // Process aggregated traffic data to replace MAC with hostname
-        foreach ($trafficData as $trafficRow) {
-            $deviceMac = $trafficRow['device_mac'];
-            $resolvedName = $deviceMac; // Default to MAC
-
-            if ($deviceMac === 'wan:') {
-                $resolvedName = 'wan:'; // Keep 'wan:' as is
-            } elseif (isset($macToHostnameMap[$deviceMac])) {
-                $resolvedName = $macToHostnameMap[$deviceMac];
-            }
-
-            $processedResults[] = [
-                'hostname' => $resolvedName,
-                'rx_bytes' => (int)$trafficRow['total_rx_bytes'], // Cast to int as SUM can return string
-                'tx_bytes' => (int)$trafficRow['total_tx_bytes']  // Cast to int as SUM can return string
-            ];
-        }
-
-        // Fetch the last update timestamp for traffic data for the 'final' type as well
-        $stmtLastUpdate = $conn->prepare("SELECT MAX(timestamp) FROM traffic_data");
-        $stmtLastUpdate->execute();
-        $lastUpdated = $stmtLastUpdate->fetchColumn();
-
-    } else { // Default to 'traffic'
-        $tableName = 'traffic_data';
-        $columns = 'device_mac, rx_bytes, tx_bytes';
-        $orderBy = 'device_mac ASC';
-
-        // Fetch the last update timestamp for traffic data
-        $stmtLastUpdate = $conn->prepare("SELECT MAX(timestamp) FROM traffic_data");
-        $stmtLastUpdate->execute();
-        $lastUpdated = $stmtLastUpdate->fetchColumn();
-
-        // Fetch all results as an associative array
-        $stmt = $conn->prepare("SELECT " . $columns . " FROM " . $tableName . " ORDER BY " . $orderBy);
+    } elseif ($dataType === 'dashboard') {
+        // This is the main endpoint. It directly queries the total_traffic table
+        // and joins it with dhcp_leases for hostname resolution.
+        $query = "SELECT
+                      tt.device_mac,
+                      tt.total_rx_bytes,
+                      tt.total_tx_bytes,
+                      CASE
+                          WHEN tt.device_mac = 'wan:' THEN 'wan:'
+                          WHEN dh.hostname IS NOT NULL AND dh.hostname != '' THEN dh.hostname
+                          WHEN dh.ip_address IS NOT NULL AND dh.ip_address != '' THEN dh.ip_address
+                          ELSE tt.device_mac
+                      END as hostname
+                  FROM total_traffic tt
+                  LEFT JOIN dhcp_leases dh ON tt.device_mac = dh.mac_address
+                  ORDER BY hostname ASC";
+        
+        $stmt = $conn->prepare($query);
         $stmt->execute();
         $processedResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    } else {
+        // Handle unknown data types
+        http_response_code(400); // Bad Request
+        echo json_encode([
+            "status" => "error",
+            "message" => "Invalid data type specified. Valid types are: leases and dashboard."
+        ], JSON_PRETTY_PRINT);
+        exit;
     }
 
     // Prepare the response array
     $response = [
         "status" => "success",
         "data_type" => $dataType,
+        "last_updated" => $lastUpdated,
         "data" => $processedResults
     ];
-
-    // Add last_updated for 'traffic' and 'final' data types
-    if ($dataType === 'traffic' || $dataType === 'final') {
-        $response['last_updated'] = $lastUpdated;
-    }
 
     // Output the results as JSON
     echo json_encode($response, JSON_PRETTY_PRINT);
@@ -163,5 +120,4 @@ try {
         $conn = null;
     }
 }
-
 ?>
